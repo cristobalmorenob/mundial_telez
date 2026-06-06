@@ -1,0 +1,464 @@
+// ═══════════════════════════════════════════════════════════
+// MUNDIAL 2026 — APPS SCRIPT BACKEND
+// ═══════════════════════════════════════════════════════════
+// Instrucciones:
+// 1. En Google Sheets → Extensiones → Apps Script
+// 2. Pega este código completo
+// 3. Guarda (Ctrl+S)
+// 4. Clic en "Implementar" → "Nueva implementación"
+//    - Tipo: Aplicación web
+//    - Ejecutar como: Yo
+//    - Quién tiene acceso: Cualquier persona
+// 5. Autoriza y copia la URL generada → ponla en el HTML
+// ═══════════════════════════════════════════════════════════
+
+const SHEET_NAME_RESULTADOS     = 'resultados';
+const SHEET_NAME_PRED_GRUPOS    = 'predicciones_grupos';
+const SHEET_NAME_PRED_LLAVE     = 'predicciones_llave';
+const SHEET_NAME_USUARIOS       = 'usuarios';
+const SHEET_NAME_CONFIG         = 'config';
+
+// ── CORS HANDLER ──────────────────────────────────────────
+function doGet(e) {
+  const action = e.parameter.action;
+  let result;
+  try {
+    switch(action) {
+      case 'getRanking':      result = getRanking(); break;
+      case 'getResultados':   result = getResultados(); break;
+      case 'getUsuarios':     result = getUsuarios(); break;
+      case 'getConfig':       result = getConfig(); break;
+      case 'getMisPicks':     result = getMisPicks(e.parameter.userId); break;
+      default: result = {error: 'Acción no reconocida'};
+    }
+  } catch(err) {
+    result = {error: err.toString()};
+  }
+  return ContentService
+    .createTextOutput(JSON.stringify(result))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function doPost(e) {
+  let body, result;
+  try {
+    body = JSON.parse(e.postData.contents);
+    const action = body.action;
+    switch(action) {
+      case 'registrarUsuario':    result = registrarUsuario(body); break;
+      case 'guardarPicksGrupos':  result = guardarPicksGrupos(body); break;
+      case 'guardarPicksLlave':   result = guardarPicksLlave(body); break;
+      case 'guardarResultado':    result = guardarResultado(body); break;
+      case 'verificarAdmin':      result = verificarAdmin(body); break;
+      case 'setFase':             result = setFase(body); break;
+      default: result = {error: 'Acción no reconocida'};
+    }
+  } catch(err) {
+    result = {error: err.toString()};
+  }
+  return ContentService
+    .createTextOutput(JSON.stringify(result))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+// ── HELPERS ───────────────────────────────────────────────
+function getSheet(name) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(name);
+  if (!sheet) sheet = ss.insertSheet(name);
+  return sheet;
+}
+
+function sheetToObjects(sheet) {
+  const data = sheet.getDataRange().getValues();
+  if (data.length < 2) return [];
+  const headers = data[0];
+  return data.slice(1).map(row => {
+    const obj = {};
+    headers.forEach((h, i) => { obj[h] = row[i]; });
+    return obj;
+  });
+}
+
+function appendRow(sheetName, obj, headers) {
+  const sheet = getSheet(sheetName);
+  // Init headers if sheet is empty
+  if (sheet.getLastRow() === 0) {
+    sheet.appendRow(headers);
+  }
+  const row = headers.map(h => obj[h] !== undefined ? obj[h] : '');
+  sheet.appendRow(row);
+}
+
+function updateOrAppend(sheetName, keyField, keyValue, obj, headers) {
+  const sheet = getSheet(sheetName);
+  if (sheet.getLastRow() === 0) {
+    sheet.appendRow(headers);
+  }
+  const data = sheet.getDataRange().getValues();
+  const headerRow = data[0];
+  const keyCol = headerRow.indexOf(keyField);
+  if (keyCol === -1) return false;
+
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][keyCol] === keyValue) {
+      // Update existing row
+      const newRow = headerRow.map(h => obj[h] !== undefined ? obj[h] : data[i][headerRow.indexOf(h)]);
+      sheet.getRange(i + 1, 1, 1, newRow.length).setValues([newRow]);
+      return true;
+    }
+  }
+  // Append new
+  const row = headers.map(h => obj[h] !== undefined ? obj[h] : '');
+  sheet.appendRow(row);
+  return true;
+}
+
+// ── USUARIOS ──────────────────────────────────────────────
+const USUARIOS_HEADERS = ['userId','nombre','timestamp','confirmado_grupos','confirmado_llave'];
+
+function registrarUsuario(body) {
+  const {nombre} = body;
+  if (!nombre || nombre.trim() === '') return {error: 'Nombre requerido'};
+
+  const sheet = getSheet(SHEET_NAME_USUARIOS);
+  // Check if exists
+  if (sheet.getLastRow() > 0) {
+    const data = sheet.getDataRange().getValues();
+    const headers = data[0];
+    const nombreCol = headers.indexOf('nombre');
+    const idCol = headers.indexOf('userId');
+    for (let i = 1; i < data.length; i++) {
+      if (data[i][nombreCol] && data[i][nombreCol].toString().toLowerCase() === nombre.trim().toLowerCase()) {
+        return {ok: true, userId: data[i][idCol], nombre: data[i][nombreCol], existing: true};
+      }
+    }
+  }
+
+  const userId = 'u' + Date.now();
+  const obj = {
+    userId, nombre: nombre.trim(),
+    timestamp: new Date().toISOString(),
+    confirmado_grupos: 'false',
+    confirmado_llave: 'false'
+  };
+  appendRow(SHEET_NAME_USUARIOS, obj, USUARIOS_HEADERS);
+  return {ok: true, userId, nombre: nombre.trim(), existing: false};
+}
+
+function getUsuarios() {
+  const sheet = getSheet(SHEET_NAME_USUARIOS);
+  if (sheet.getLastRow() === 0) return [];
+  return sheetToObjects(sheet);
+}
+
+// ── PICKS GRUPOS ──────────────────────────────────────────
+const PICKS_G_HEADERS = ['userId','matchId','hs','as','timestamp'];
+
+function guardarPicksGrupos(body) {
+  const {userId, picks} = body; // picks = [{matchId, hs, as}, ...]
+  if (!userId || !picks) return {error: 'Faltan datos'};
+
+  // Check if already confirmed
+  const usuarios = getUsuarios();
+  const user = usuarios.find(u => u.userId === userId);
+  if (user && user.confirmado_grupos === 'true') {
+    return {error: 'Ya confirmaste tus picks de grupos. No se pueden modificar.'};
+  }
+
+  const sheet = getSheet(SHEET_NAME_PRED_GRUPOS);
+  // Init headers
+  if (sheet.getLastRow() === 0) sheet.appendRow(PICKS_G_HEADERS);
+
+  // Delete existing picks for this user
+  if (sheet.getLastRow() > 1) {
+    const data = sheet.getDataRange().getValues();
+    const userIdCol = data[0].indexOf('userId');
+    const rowsToDelete = [];
+    for (let i = 1; i < data.length; i++) {
+      if (data[i][userIdCol] === userId) rowsToDelete.push(i + 1);
+    }
+    // Delete from bottom to top
+    rowsToDelete.reverse().forEach(row => sheet.deleteRow(row));
+  }
+
+  // Write all picks
+  const ts = new Date().toISOString();
+  picks.forEach(p => {
+    sheet.appendRow([userId, p.matchId, p.hs, p.as, ts]);
+  });
+
+  // Mark as confirmed
+  markConfirmado(userId, 'confirmado_grupos');
+
+  return {ok: true, count: picks.length};
+}
+
+// ── PICKS LLAVE ───────────────────────────────────────────
+const PICKS_L_HEADERS = ['userId','equipo','ronda','timestamp'];
+
+function guardarPicksLlave(body) {
+  const {userId, picks} = body; // picks = [{equipo, ronda}, ...]
+  if (!userId || !picks) return {error: 'Faltan datos'};
+
+  const usuarios = getUsuarios();
+  const user = usuarios.find(u => u.userId === userId);
+  if (user && user.confirmado_llave === 'true') {
+    return {error: 'Ya confirmaste tus picks de llave. No se pueden modificar.'};
+  }
+
+  const sheet = getSheet(SHEET_NAME_PRED_LLAVE);
+  if (sheet.getLastRow() === 0) sheet.appendRow(PICKS_L_HEADERS);
+
+  // Delete existing
+  if (sheet.getLastRow() > 1) {
+    const data = sheet.getDataRange().getValues();
+    const userIdCol = data[0].indexOf('userId');
+    const rowsToDelete = [];
+    for (let i = 1; i < data.length; i++) {
+      if (data[i][userIdCol] === userId) rowsToDelete.push(i + 1);
+    }
+    rowsToDelete.reverse().forEach(row => sheet.deleteRow(row));
+  }
+
+  const ts = new Date().toISOString();
+  picks.forEach(p => {
+    sheet.appendRow([userId, p.equipo, p.ronda, ts]);
+  });
+
+  markConfirmado(userId, 'confirmado_llave');
+  return {ok: true, count: picks.length};
+}
+
+function markConfirmado(userId, field) {
+  const sheet = getSheet(SHEET_NAME_USUARIOS);
+  const data = sheet.getDataRange().getValues();
+  const headers = data[0];
+  const userIdCol = headers.indexOf('userId');
+  const fieldCol = headers.indexOf(field);
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][userIdCol] === userId) {
+      sheet.getRange(i + 1, fieldCol + 1).setValue('true');
+      return;
+    }
+  }
+}
+
+// ── RESULTADOS (ADMIN) ────────────────────────────────────
+const RESULTADOS_HEADERS = ['matchId','hs','as','sim','timestamp'];
+
+function guardarResultado(body) {
+  const {adminHash, matchId, hs, as, sim} = body;
+  if (!verificarHash(adminHash)) return {error: 'No autorizado'};
+
+  const obj = {
+    matchId, hs, as,
+    sim: sim ? 'true' : 'false',
+    timestamp: new Date().toISOString()
+  };
+  updateOrAppend(SHEET_NAME_RESULTADOS, 'matchId', matchId, obj, RESULTADOS_HEADERS);
+  return {ok: true};
+}
+
+function getResultados() {
+  const sheet = getSheet(SHEET_NAME_RESULTADOS);
+  if (sheet.getLastRow() === 0) return [];
+  return sheetToObjects(sheet);
+}
+
+// ── CONFIG / ADMIN ────────────────────────────────────────
+function getConfig() {
+  const sheet = getSheet(SHEET_NAME_CONFIG);
+  if (sheet.getLastRow() === 0) return {fase_activa: 'grupos'};
+  const data = sheet.getDataRange().getValues();
+  const config = {};
+  data.forEach(row => { if(row[0]) config[row[0]] = row[1]; });
+  return config;
+}
+
+function verificarHash(hash) {
+  const config = getConfig();
+  return config.clave_admin === hash;
+}
+
+function verificarAdmin(body) {
+  const {hash} = body;
+  if (verificarHash(hash)) return {ok: true};
+  return {error: 'Contraseña incorrecta'};
+}
+
+function setFase(body) {
+  const {adminHash, fase} = body;
+  if (!verificarHash(adminHash)) return {error: 'No autorizado'};
+
+  const sheet = getSheet(SHEET_NAME_CONFIG);
+  const data = sheet.getDataRange().getValues();
+  for (let i = 0; i < data.length; i++) {
+    if (data[i][0] === 'fase_activa') {
+      sheet.getRange(i + 1, 2).setValue(fase);
+      return {ok: true, fase};
+    }
+  }
+  sheet.appendRow(['fase_activa', fase]);
+  return {ok: true, fase};
+}
+
+// ── RANKING ───────────────────────────────────────────────
+// ROUND_ORDER and increments (same as frontend)
+const ROUND_ORDER = ['GROUPS','R32','R16','QF','SF','FINAL','CHAMPION'];
+const ROUND_INCREMENTS = {R32:1, R16:2, QF:3, SF:4, FINAL:5, CHAMPION:5};
+
+function calcRoundPoints(predRound, realRound) {
+  const pi = ROUND_ORDER.indexOf(predRound);
+  const ri = ROUND_ORDER.indexOf(realRound);
+  if (pi <= 0) return 0;
+  const minR = Math.min(pi, ri);
+  let pts = 0;
+  for (let i = 1; i <= minR; i++) {
+    pts += ROUND_INCREMENTS[ROUND_ORDER[i]] || 0;
+  }
+  return pts;
+}
+
+function calcGroupMatchPoints(predHs, predAs, realHs, realAs) {
+  const ph = parseInt(predHs), pa = parseInt(predAs);
+  const rh = parseInt(realHs), ra = parseInt(realAs);
+  if (ph === rh && pa === ra) return 3;
+  const predRes = ph > pa ? 1 : ph < pa ? -1 : 0;
+  const realRes = rh > ra ? 1 : rh < ra ? -1 : 0;
+  return predRes === realRes ? 1 : 0;
+}
+
+function getRanking() {
+  const usuarios = getUsuarios();
+  const resultados = getResultados();
+  const resMap = {};
+  resultados.forEach(r => { resMap[r.matchId] = r; });
+
+  // Get all group picks
+  const pgSheet = getSheet(SHEET_NAME_PRED_GRUPOS);
+  const pgData = pgSheet.getLastRow() > 0 ? sheetToObjects(pgSheet) : [];
+  const groupPicksByUser = {};
+  pgData.forEach(p => {
+    if (!groupPicksByUser[p.userId]) groupPicksByUser[p.userId] = {};
+    groupPicksByUser[p.userId][p.matchId] = {hs: p.hs, as: p.as};
+  });
+
+  // Get all llave picks
+  const plSheet = getSheet(SHEET_NAME_PRED_LLAVE);
+  const plData = plSheet.getLastRow() > 0 ? sheetToObjects(plSheet) : [];
+  const llavePicksByUser = {};
+  plData.forEach(p => {
+    if (!llavePicksByUser[p.userId]) llavePicksByUser[p.userId] = {};
+    llavePicksByUser[p.userId][p.equipo] = p.ronda;
+  });
+
+  // Compute real rounds for each team from results
+  // (simplified: just use matchId patterns to determine rounds)
+  const realRounds = computeRealRounds(resMap);
+
+  const ranking = usuarios.map(u => {
+    const uid = u.userId;
+    let ptsGrupos = 0, ptsLlave = 0;
+    const userGroupPicks = groupPicksByUser[uid] || {};
+    const userLlavePicks = llavePicksByUser[uid] || {};
+
+    // Groups score
+    Object.entries(userGroupPicks).forEach(([matchId, pick]) => {
+      const real = resMap[matchId];
+      if (!real || real.hs === '' || real.hs === undefined) return;
+      ptsGrupos += calcGroupMatchPoints(pick.hs, pick.as, real.hs, real.as);
+    });
+
+    // Llave score
+    Object.entries(userLlavePicks).forEach(([equipo, predRound]) => {
+      const realRound = realRounds[equipo] || 'GROUPS';
+      ptsLlave += calcRoundPoints(predRound, realRound);
+    });
+
+    return {
+      userId: uid,
+      nombre: u.nombre,
+      ptsGrupos,
+      ptsLlave,
+      total: ptsGrupos + ptsLlave,
+      confirmado_grupos: u.confirmado_grupos,
+      confirmado_llave: u.confirmado_llave,
+    };
+  });
+
+  ranking.sort((a, b) => b.total - a.total);
+  ranking.forEach((r, i) => { r.posicion = i + 1; });
+  return ranking;
+}
+
+function computeRealRounds(resMap) {
+  // Based on match IDs, determine which teams reached which round
+  const rounds = {};
+
+  // Helper: get winner from result
+  function getWinner(matchId, homeTeam, awayTeam) {
+    const r = resMap[matchId];
+    if (!r || r.hs === '' || r.hs === undefined) return null;
+    const hs = parseInt(r.hs), as = parseInt(r.as);
+    if (hs > as) return homeTeam;
+    if (as > hs) return awayTeam;
+    return r.pw === 'home' ? homeTeam : awayTeam;
+  }
+
+  // R32 winners reach R16, etc.
+  // This is computed client-side in the full app
+  // Here we just return what we can from the matchIds
+  // The full computation happens in the frontend for performance
+  return rounds;
+}
+
+function getMisPicks(userId) {
+  if (!userId) return {error: 'userId requerido'};
+
+  const pgSheet = getSheet(SHEET_NAME_PRED_GRUPOS);
+  const pgData = pgSheet.getLastRow() > 0 ? sheetToObjects(pgSheet) : [];
+  const grupos = pgData.filter(p => p.userId === userId);
+
+  const plSheet = getSheet(SHEET_NAME_PRED_LLAVE);
+  const plData = plSheet.getLastRow() > 0 ? sheetToObjects(plSheet) : [];
+  const llave = plData.filter(p => p.userId === userId);
+
+  const usuarios = getUsuarios();
+  const user = usuarios.find(u => u.userId === userId);
+
+  return {
+    grupos,
+    llave,
+    confirmado_grupos: user?.confirmado_grupos === 'true',
+    confirmado_llave: user?.confirmado_llave === 'true',
+  };
+}
+
+// ── SETUP INICIAL ─────────────────────────────────────────
+// Ejecuta esta función UNA VEZ manualmente para inicializar las hojas
+function inicializarSheets() {
+  // Config
+  const configSheet = getSheet(SHEET_NAME_CONFIG);
+  configSheet.clearContents();
+  configSheet.appendRow(['clave', 'valor']);
+  configSheet.appendRow(['fase_activa', 'grupos']);
+  // IMPORTANTE: reemplaza el hash de abajo con el SHA-256 de tu contraseña
+  // Puedes generar el hash en: https://emn178.github.io/online-tools/sha256.html
+  configSheet.appendRow(['clave_admin', 'REEMPLAZA_CON_TU_HASH_SHA256']);
+
+  // Headers para las otras hojas
+  getSheet(SHEET_NAME_USUARIOS).clearContents();
+  getSheet(SHEET_NAME_USUARIOS).appendRow(USUARIOS_HEADERS);
+
+  getSheet(SHEET_NAME_PRED_GRUPOS).clearContents();
+  getSheet(SHEET_NAME_PRED_GRUPOS).appendRow(PICKS_G_HEADERS);
+
+  getSheet(SHEET_NAME_PRED_LLAVE).clearContents();
+  getSheet(SHEET_NAME_PRED_LLAVE).appendRow(PICKS_L_HEADERS);
+
+  getSheet(SHEET_NAME_RESULTADOS).clearContents();
+  getSheet(SHEET_NAME_RESULTADOS).appendRow(RESULTADOS_HEADERS);
+
+  return 'Sheets inicializadas correctamente';
+}
